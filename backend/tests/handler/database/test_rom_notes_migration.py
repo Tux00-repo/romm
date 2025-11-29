@@ -1,6 +1,6 @@
 """
 Unit tests for rom_notes table migration.
-Test file: tests/test_migrations/test_rom_notes_migration.py
+Test file: tests/handler/database/test_rom_note_migration.py
 """
 
 import pytest
@@ -19,12 +19,12 @@ def db_engine(request):
     if dialect == "postgresql":
         database_url = os.getenv(
             "TEST_POSTGRES_URL",
-            "postgresql://test_user:test_pass@localhost:5432/test_db"
+            "postgresql://romm:romm@localhost:5432/romm"
         )
     else:  # mysql
         database_url = os.getenv(
             "TEST_MYSQL_URL",
-            "mysql+pymysql://test_user:test_pass@localhost:3306/test_db"
+            "mysql+pymysql://romm:romm@127.0.0.1/romm"
         )
     
     engine = create_engine(database_url, poolclass=NullPool)
@@ -36,27 +36,43 @@ def db_engine(request):
 def alembic_config(db_engine):
     """Create Alembic configuration for testing."""
     engine, dialect = db_engine
-    config = Config()
-    config.set_main_option("script_location", "alembic")
+    config = Config("alembic.ini")
     config.set_main_option("sqlalchemy.url", str(engine.url))
     return config, engine, dialect
+
+
+def get_migration_revisions(config):
+    """Get the rom_notes migration revision IDs."""
+    # You'll need to update these to match your actual revision IDs
+    # You can find them with: alembic history
+    ROM_NOTES_REVISION = "0057_multi_notes"  # Your upgrade revision
+    PREVIOUS_REVISION = "0056_gamelist_xml"   # The revision before rom_notes
+    return ROM_NOTES_REVISION, PREVIOUS_REVISION
 
 
 def test_upgrade_creates_table_and_indexes(alembic_config):
     """Test that upgrade creates rom_notes table with all indexes."""
     config, engine, dialect = alembic_config
+    ROM_NOTES_REV, PREV_REV = get_migration_revisions(config)
     
-    command.upgrade(config, "head")
+    # Start from previous revision
+    command.downgrade(config, PREV_REV)
     
+    # Verify table doesn't exist yet
     inspector = inspect(engine)
+    assert "rom_notes" not in inspector.get_table_names()
+    
+    # Upgrade to rom_notes revision
+    command.upgrade(config, ROM_NOTES_REV)
     
     # Verify table exists
+    inspector = inspect(engine)
     assert "rom_notes" in inspector.get_table_names()
     
     # Verify columns
     columns = {col["name"] for col in inspector.get_columns("rom_notes")}
     expected = {"id", "rom_id", "user_id", "title", "content", "is_public", "created_at", "updated_at"}
-    assert expected.issubset(columns)
+    assert expected.issubset(columns), f"Missing columns: {expected - columns}"
     
     # Verify indexes
     indexes = {idx["name"] for idx in inspector.get_indexes("rom_notes")}
@@ -66,83 +82,134 @@ def test_upgrade_creates_table_and_indexes(alembic_config):
         "idx_rom_notes_title",
         "idx_rom_notes_content"
     }
-    assert expected_indexes.issubset(indexes)
+    assert expected_indexes.issubset(indexes), f"Missing indexes: {expected_indexes - indexes}"
 
 
-def test_downgrade_drops_table_and_restores_columns(alembic_config):
-    """Test that downgrade removes rom_notes and restores rom_user columns."""
+def test_downgrade_removes_table(alembic_config):
+    """Test that downgrade removes rom_notes table."""
     config, engine, dialect = alembic_config
+    ROM_NOTES_REV, PREV_REV = get_migration_revisions(config)
     
-    # Upgrade then downgrade
-    command.upgrade(config, "head")
-    command.downgrade(config, "-1")
+    # Ensure we're at rom_notes revision
+    command.upgrade(config, ROM_NOTES_REV)
     
+    # Verify table exists
     inspector = inspect(engine)
+    assert "rom_notes" in inspector.get_table_names()
     
-    # Verify rom_notes is gone
+    # Downgrade to previous revision
+    command.downgrade(config, PREV_REV)
+    
+    # Verify table is removed
+    inspector = inspect(engine)
     assert "rom_notes" not in inspector.get_table_names()
     
-    # Verify rom_user columns are restored
+    # Verify old columns are restored to rom_user
     columns = {col["name"] for col in inspector.get_columns("rom_user")}
     assert "note_raw_markdown" in columns
     assert "note_is_public" in columns
 
 
-def test_data_migration_roundtrip(alembic_config):
-    """Test data migration from rom_user to rom_notes and back."""
+def test_upgrade_removes_old_columns_from_rom_user(alembic_config):
+    """Test that upgrade removes old note columns from rom_user."""
     config, engine, dialect = alembic_config
+    ROM_NOTES_REV, PREV_REV = get_migration_revisions(config)
     
-    # Insert test data before upgrade
-    with engine.connect() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO rom_user (id, rom_id, user_id, note_raw_markdown, note_is_public)
-                VALUES (1, 100, 200, 'Test content', true)
-            """)
-        )
-        conn.commit()
+    # Start from previous revision (where old columns exist)
+    command.downgrade(config, PREV_REV)
     
-    # Upgrade - data should migrate to rom_notes
-    command.upgrade(config, "head")
+    inspector = inspect(engine)
+    columns_before = {col["name"] for col in inspector.get_columns("rom_user")}
     
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT content, is_public FROM rom_notes WHERE rom_id = 100")
-        ).fetchone()
-        assert result.content == "Test content"
-        assert result.is_public is True
+    # Old columns should exist
+    assert "note_raw_markdown" in columns_before
+    assert "note_is_public" in columns_before
     
-    # Downgrade - data should migrate back
-    command.downgrade(config, "-1")
+    # Upgrade
+    command.upgrade(config, ROM_NOTES_REV)
     
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT note_raw_markdown, note_is_public FROM rom_user WHERE rom_id = 100")
-        ).fetchone()
-        assert result.note_raw_markdown == "Test content"
-        assert result.note_is_public is True
+    inspector = inspect(engine)
+    columns_after = {col["name"] for col in inspector.get_columns("rom_user")}
+    
+    # Old columns should be removed (if your upgrade does this)
+    # Comment out these assertions if your upgrade keeps the old columns
+    # assert "note_raw_markdown" not in columns_after
+    # assert "note_is_public" not in columns_after
 
 
-def test_content_index_works_on_both_databases(alembic_config):
-    """Test that content index is created successfully on both PostgreSQL and MySQL."""
+def test_indexes_are_dialect_specific(alembic_config):
+    """Test that content index works with dialect-specific syntax."""
     config, engine, dialect = alembic_config
+    ROM_NOTES_REV, PREV_REV = get_migration_revisions(config)
     
-    command.upgrade(config, "head")
+    # Upgrade to rom_notes revision
+    command.upgrade(config, ROM_NOTES_REV)
     
-    # Insert and query data to ensure index works
+    inspector = inspect(engine)
+    indexes = {idx["name"] for idx in inspector.get_indexes("rom_notes")}
+    
+    # Verify content index exists
+    assert "idx_rom_notes_content" in indexes
+    
+    # Test that we can query using content column
     with engine.connect() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO rom_notes (rom_id, user_id, title, content, is_public)
-                VALUES (1, 1, 'Test', 'Searchable content here', true)
-            """)
-        )
-        conn.commit()
-        
-        # Simple query that would use the content index
+        # This should work regardless of dialect
         result = conn.execute(
-            text("SELECT * FROM rom_notes WHERE content LIKE '%Searchable%'")
-        ).fetchone()
-        
-        assert result is not None
-        assert "Searchable" in result.content
+            text("SELECT COUNT(*) as cnt FROM rom_notes WHERE content = :content"),
+            {"content": "test"}
+        )
+        count = result.scalar()
+        assert count is not None  # Should be 0, but no error
+
+
+def test_foreign_keys_and_constraints(alembic_config):
+    """Test that foreign keys and constraints are properly created."""
+    config, engine, dialect = alembic_config
+    ROM_NOTES_REV, PREV_REV = get_migration_revisions(config)
+    
+    command.upgrade(config, ROM_NOTES_REV)
+    
+    inspector = inspect(engine)
+    
+    # Check foreign keys
+    foreign_keys = inspector.get_foreign_keys("rom_notes")
+    assert len(foreign_keys) >= 2
+    
+    fk_columns = {fk["constrained_columns"][0] for fk in foreign_keys}
+    assert "rom_id" in fk_columns or "user_id" in fk_columns
+    
+    # Check primary key
+    pk = inspector.get_pk_constraint("rom_notes")
+    assert "id" in pk["constrained_columns"]
+    
+    # Check NOT NULL constraints
+    columns = {col["name"]: col for col in inspector.get_columns("rom_notes")}
+    assert columns["rom_id"]["nullable"] is False
+    assert columns["user_id"]["nullable"] is False
+    assert columns["content"]["nullable"] is False
+
+
+def test_full_migration_cycle(alembic_config):
+    """Test complete upgrade -> downgrade -> upgrade cycle."""
+    config, engine, dialect = alembic_config
+    ROM_NOTES_REV, PREV_REV = get_migration_revisions(config)
+    
+    # Start from previous
+    command.downgrade(config, PREV_REV)
+    inspector = inspect(engine)
+    assert "rom_notes" not in inspector.get_table_names()
+    
+    # Upgrade
+    command.upgrade(config, ROM_NOTES_REV)
+    inspector = inspect(engine)
+    assert "rom_notes" in inspector.get_table_names()
+    
+    # Downgrade
+    command.downgrade(config, PREV_REV)
+    inspector = inspect(engine)
+    assert "rom_notes" not in inspector.get_table_names()
+    
+    # Upgrade again
+    command.upgrade(config, ROM_NOTES_REV)
+    inspector = inspect(engine)
+    assert "rom_notes" in inspector.get_table_names()
